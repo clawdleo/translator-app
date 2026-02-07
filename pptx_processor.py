@@ -1,9 +1,11 @@
 """
-PPTX Processor Module
-Handles surgical text translation in PowerPoint files.
+PPTX Processor - OPTIMIZED
+--------------------------
+Fast processing with batch translation per slide.
 """
 
 import logging
+from typing import List, Tuple
 from pptx import Presentation
 from pptx.shapes.group import GroupShape
 from pptx.shapes.base import BaseShape
@@ -35,22 +37,22 @@ class PPTXProcessor:
     
     def process_file(self, input_path: str, output_path: str) -> dict:
         try:
-            self._update_status(f"Loading presentation...")
+            self._update_status("Loading presentation...")
             prs = Presentation(input_path)
             num_slides = len(prs.slides)
-            self._update_status(f"Loaded {num_slides} slides")
+            self._update_status(f"Loaded {num_slides} slides - using fast batch mode")
             
             for slide_idx, slide in enumerate(prs.slides):
                 try:
-                    self._update_status(f"Processing slide {slide_idx + 1}/{num_slides}...")
-                    self._process_slide(slide)
+                    self._update_status(f"Slide {slide_idx + 1}/{num_slides}...")
+                    self._process_slide_batch(slide)
                     self.stats['slides_processed'] += 1
                 except Exception as e:
                     error_msg = f"Error on slide {slide_idx + 1}: {e}"
                     logger.error(error_msg)
                     self.stats['errors'].append(error_msg)
             
-            self._update_status(f"Saving translated presentation...")
+            self._update_status("Saving translated presentation...")
             prs.save(output_path)
             
             self.stats['translator_stats'] = self.translator.get_stats()
@@ -61,102 +63,113 @@ class PPTXProcessor:
             self.stats['errors'].append(str(e))
             raise
     
-    def _process_slide(self, slide) -> None:
+    def _process_slide_batch(self, slide) -> None:
+        """
+        OPTIMIZED: Collect all texts from slide, batch translate, then apply.
+        Much faster than translating one text at a time.
+        """
+        # Collect all text locations
+        text_locations: List[Tuple] = []  # (paragraph, runs, original_texts, combined_text)
+        
+        # Gather from all shapes
         for shape in slide.shapes:
-            self._process_shape(shape)
-        self._process_notes(slide)
+            self._collect_texts(shape, text_locations)
+        
+        # Gather from notes
+        try:
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                for para in slide.notes_slide.notes_text_frame.paragraphs:
+                    runs = list(para.runs)
+                    if runs:
+                        orig = [r.text for r in runs]
+                        combined = ''.join(orig)
+                        if combined.strip():
+                            text_locations.append((para, runs, orig, combined))
+        except:
+            pass
+        
+        if not text_locations:
+            return
+        
+        # Batch translate all texts at once
+        all_texts = [loc[3] for loc in text_locations]
+        translated_texts = self.translator.translate_batch(all_texts)
+        
+        # Apply translations back
+        for (para, runs, orig_texts, orig_combined), translated in zip(text_locations, translated_texts):
+            if translated and translated != orig_combined:
+                self._redistribute_text_to_runs(runs, orig_texts, translated)
+                self.stats['text_runs_translated'] += len(runs)
     
-    def _process_shape(self, shape: BaseShape) -> None:
+    def _collect_texts(self, shape: BaseShape, text_locations: List) -> None:
+        """Recursively collect all translatable text from a shape."""
         try:
             if isinstance(shape, GroupShape):
                 self.stats['groups_traversed'] += 1
-                for child_shape in shape.shapes:
-                    self._process_shape(child_shape)
+                for child in shape.shapes:
+                    self._collect_texts(child, text_locations)
                 return
             
             if shape.has_table:
-                self._process_table(shape.table)
+                self._collect_table_texts(shape.table, text_locations)
+                self.stats['tables_processed'] += 1
                 return
             
             if shape.has_text_frame:
-                self._process_text_frame(shape.text_frame)
+                for para in shape.text_frame.paragraphs:
+                    runs = list(para.runs)
+                    if runs:
+                        orig = [r.text for r in runs]
+                        combined = ''.join(orig)
+                        if combined.strip() and len(combined.strip()) >= 2:
+                            text_locations.append((para, runs, orig, combined))
             
             self.stats['shapes_processed'] += 1
             
         except Exception as e:
-            error_msg = f"Error processing shape: {e}"
-            logger.warning(error_msg)
-            self.stats['errors'].append(error_msg)
+            self.stats['errors'].append(f"Shape error: {e}")
     
-    def _process_text_frame(self, text_frame: TextFrame) -> None:
-        for paragraph in text_frame.paragraphs:
-            self._process_paragraph(paragraph)
-    
-    def _process_paragraph(self, paragraph) -> None:
-        runs = list(paragraph.runs)
-        if not runs:
-            return
-        
-        original_texts = [run.text for run in runs]
-        combined_text = ''.join(original_texts)
-        
-        if not combined_text.strip():
-            return
-        
-        translated_text = self.translator.translate(combined_text)
-        
-        if translated_text == combined_text:
-            return
-        
-        self._redistribute_text_to_runs(runs, original_texts, translated_text)
-        self.stats['text_runs_translated'] += len(runs)
-    
-    def _redistribute_text_to_runs(self, runs, original_texts, translated_text) -> None:
-        total_original_len = sum(len(t) for t in original_texts)
-        
-        if total_original_len == 0:
-            if runs:
-                runs[0].text = translated_text
-            return
-        
-        translated_len = len(translated_text)
-        current_pos = 0
-        
-        for i, (run, orig_text) in enumerate(zip(runs, original_texts)):
-            if i == len(runs) - 1:
-                run.text = translated_text[current_pos:]
-            else:
-                proportion = len(orig_text) / total_original_len
-                chars_for_run = int(translated_len * proportion)
-                end_pos = current_pos + chars_for_run
-                
-                if end_pos < translated_len:
-                    space_pos = translated_text.rfind(' ', current_pos, end_pos + 10)
-                    if space_pos > current_pos:
-                        end_pos = space_pos + 1
-                
-                run.text = translated_text[current_pos:end_pos]
-                current_pos = end_pos
-    
-    def _process_table(self, table: Table) -> None:
+    def _collect_table_texts(self, table: Table, text_locations: List) -> None:
+        """Collect all text from table cells."""
         try:
             for row in table.rows:
                 for cell in row.cells:
                     if cell.text_frame:
-                        self._process_text_frame(cell.text_frame)
-            self.stats['tables_processed'] += 1
+                        for para in cell.text_frame.paragraphs:
+                            runs = list(para.runs)
+                            if runs:
+                                orig = [r.text for r in runs]
+                                combined = ''.join(orig)
+                                if combined.strip() and len(combined.strip()) >= 2:
+                                    text_locations.append((para, runs, orig, combined))
         except Exception as e:
-            error_msg = f"Error processing table: {e}"
-            logger.warning(error_msg)
-            self.stats['errors'].append(error_msg)
+            self.stats['errors'].append(f"Table error: {e}")
     
-    def _process_notes(self, slide) -> None:
-        try:
-            if not slide.has_notes_slide:
-                return
-            notes_slide = slide.notes_slide
-            if notes_slide and notes_slide.notes_text_frame:
-                self._process_text_frame(notes_slide.notes_text_frame)
-                self.stats['notes_translated'] += 1
-        except Exception as e:
-            logger.debug(f"Could not access notes: {e}")
+    def _redistribute_text_to_runs(self, runs, original_texts, translated_text) -> None:
+        """Redistribute translated text back to runs proportionally."""
+        total_len = sum(len(t) for t in original_texts)
+        
+        if total_len == 0:
+            if runs:
+                runs[0].text = translated_text
+            return
+        
+        trans_len = len(translated_text)
+        pos = 0
+        
+        for i, (run, orig) in enumerate(zip(runs, original_texts)):
+            if i == len(runs) - 1:
+                run.text = translated_text[pos:]
+            else:
+                prop = len(orig) / total_len
+                chars = int(trans_len * prop)
+                end = pos + chars
+                
+                # Break at word boundary if possible
+                if end < trans_len:
+                    space = translated_text.rfind(' ', pos, end + 10)
+                    if space > pos:
+                        end = space + 1
+                
+                run.text = translated_text[pos:end]
+                pos = end

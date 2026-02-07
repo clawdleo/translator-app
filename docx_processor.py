@@ -1,9 +1,11 @@
 """
-DOCX Processor Module
-Handles text translation in Word documents while preserving formatting.
+DOCX Processor - OPTIMIZED
+--------------------------
+Fast processing with batch translation.
 """
 
 import logging
+from typing import List, Tuple
 from docx import Document
 from docx.table import Table
 
@@ -34,28 +36,47 @@ class DOCXProcessor:
             self._update_status("Loading document...")
             doc = Document(input_path)
             
-            # Process main body paragraphs
-            total_paragraphs = len(doc.paragraphs)
-            self._update_status(f"Processing {total_paragraphs} paragraphs...")
+            # Collect all text locations
+            text_locations: List[Tuple] = []
             
-            for idx, paragraph in enumerate(doc.paragraphs):
-                if idx % 10 == 0:
-                    self._update_status(f"Processing paragraph {idx + 1}/{total_paragraphs}...")
-                self._process_paragraph(paragraph)
+            # Main body
+            self._update_status("Collecting text from document...")
+            for para in doc.paragraphs:
+                self._collect_paragraph(para, text_locations)
                 self.stats['paragraphs_processed'] += 1
             
-            # Process tables
-            if doc.tables:
-                self._update_status(f"Processing {len(doc.tables)} tables...")
-                for table in doc.tables:
-                    self._process_table(table)
+            # Tables
+            for table in doc.tables:
+                self._collect_table(table, text_locations)
+                self.stats['tables_processed'] += 1
             
-            # Process headers and footers
-            self._update_status("Processing headers and footers...")
+            # Headers and footers
             for section in doc.sections:
-                self._process_header_footer(section)
+                try:
+                    if section.header:
+                        for para in section.header.paragraphs:
+                            self._collect_paragraph(para, text_locations)
+                        self.stats['headers_processed'] += 1
+                    if section.footer:
+                        for para in section.footer.paragraphs:
+                            self._collect_paragraph(para, text_locations)
+                        self.stats['footers_processed'] += 1
+                except:
+                    pass
             
-            # Save the document
+            if text_locations:
+                self._update_status(f"Batch translating {len(text_locations)} text blocks...")
+                
+                # Batch translate
+                all_texts = [loc[2] for loc in text_locations]
+                translated = self.translator.translate_batch(all_texts)
+                
+                # Apply translations
+                for (para, runs, orig_combined, orig_texts), trans in zip(text_locations, translated):
+                    if trans and trans != orig_combined:
+                        self._redistribute_text_to_runs(runs, orig_texts, trans)
+                        self.stats['text_runs_translated'] += len(runs)
+            
             self._update_status("Saving translated document...")
             doc.save(output_path)
             
@@ -67,82 +88,52 @@ class DOCXProcessor:
             self.stats['errors'].append(str(e))
             raise
     
-    def _process_paragraph(self, paragraph) -> None:
-        """Process a paragraph by translating its runs while preserving formatting."""
-        runs = paragraph.runs
+    def _collect_paragraph(self, para, text_locations: List) -> None:
+        """Collect text from a paragraph."""
+        runs = list(para.runs)
         if not runs:
             return
         
-        original_texts = [run.text for run in runs]
-        combined_text = ''.join(original_texts)
+        orig_texts = [r.text for r in runs]
+        combined = ''.join(orig_texts)
         
-        if not combined_text.strip():
-            return
-        
-        translated_text = self.translator.translate(combined_text)
-        
-        if translated_text == combined_text:
-            return
-        
-        self._redistribute_text_to_runs(runs, original_texts, translated_text)
-        self.stats['text_runs_translated'] += len(runs)
+        if combined.strip() and len(combined.strip()) >= 2:
+            text_locations.append((para, runs, combined, orig_texts))
+    
+    def _collect_table(self, table: Table, text_locations: List) -> None:
+        """Collect text from table cells."""
+        try:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        self._collect_paragraph(para, text_locations)
+        except Exception as e:
+            self.stats['errors'].append(f"Table error: {e}")
     
     def _redistribute_text_to_runs(self, runs, original_texts, translated_text) -> None:
-        """Redistribute translated text back to runs proportionally."""
-        total_original_len = sum(len(t) for t in original_texts)
+        """Redistribute translated text proportionally."""
+        total_len = sum(len(t) for t in original_texts)
         
-        if total_original_len == 0:
+        if total_len == 0:
             if runs:
                 runs[0].text = translated_text
             return
         
-        translated_len = len(translated_text)
-        current_pos = 0
+        trans_len = len(translated_text)
+        pos = 0
         
-        for i, (run, orig_text) in enumerate(zip(runs, original_texts)):
+        for i, (run, orig) in enumerate(zip(runs, original_texts)):
             if i == len(runs) - 1:
-                run.text = translated_text[current_pos:]
+                run.text = translated_text[pos:]
             else:
-                proportion = len(orig_text) / total_original_len
-                chars_for_run = int(translated_len * proportion)
-                end_pos = current_pos + chars_for_run
+                prop = len(orig) / total_len
+                chars = int(trans_len * prop)
+                end = pos + chars
                 
-                # Try to break at word boundary
-                if end_pos < translated_len:
-                    space_pos = translated_text.rfind(' ', current_pos, end_pos + 10)
-                    if space_pos > current_pos:
-                        end_pos = space_pos + 1
+                if end < trans_len:
+                    space = translated_text.rfind(' ', pos, end + 10)
+                    if space > pos:
+                        end = space + 1
                 
-                run.text = translated_text[current_pos:end_pos]
-                current_pos = end_pos
-    
-    def _process_table(self, table: Table) -> None:
-        """Process all cells in a table."""
-        try:
-            for row in table.rows:
-                for cell in row.cells:
-                    for paragraph in cell.paragraphs:
-                        self._process_paragraph(paragraph)
-            self.stats['tables_processed'] += 1
-        except Exception as e:
-            error_msg = f"Error processing table: {e}"
-            logger.warning(error_msg)
-            self.stats['errors'].append(error_msg)
-    
-    def _process_header_footer(self, section) -> None:
-        """Process headers and footers in a section."""
-        try:
-            # Process header
-            if section.header:
-                for paragraph in section.header.paragraphs:
-                    self._process_paragraph(paragraph)
-                self.stats['headers_processed'] += 1
-            
-            # Process footer
-            if section.footer:
-                for paragraph in section.footer.paragraphs:
-                    self._process_paragraph(paragraph)
-                self.stats['footers_processed'] += 1
-                
-        except Exception as e:
-            logger.debug(f"Could not access header/footer: {e}")
+                run.text = translated_text[pos:end]
+                pos = end
